@@ -77,7 +77,29 @@ usage: ./launcher.sh -c <arg> -e <arg> -l <arg> -t <arg> -w <arg>
                                  the workload definition
 ```
 
+## JDBC connection diagnostics
+
+For an instrumented JDBC run, add `-Dlst.jdbc.diagnostics=true` to the Java
+command before the main class. This opt-in logging records a local connection
+UUID, UTC and monotonic timestamps, process/thread identity, driver and Java
+versions, network/query timeout settings, and entry/exit boundaries for execution,
+result processing, warning retrieval, and statement/connection cleanup.
+
+When the driver exposes `getClientConnectionId()`, its UUID is recorded alongside
+the local UUID for correlation with server telemetry. Drivers without that
+extension are explicitly reported as unsupported; no extra SQL queries are sent.
+Diagnostics do not change query/network timeouts, retry counts, or reconnect behavior.
+An unmatched entry event identifies an operation to inspect with a thread dump;
+it does not by itself prove a network fault.
+
+Primary execution failures are logged before warning retrieval, and secondary
+warning/cleanup failures are retained without replacing the primary cause.
+Connection diagnostics do not log JDBC URLs, credentials, or SQL text. Existing
+workload/error logging can still contain SQL and server messages; restrict access
+to diagnostic artifacts accordingly.
+
 ## Configuration Files
+
 The configuration files used in LST-Bench are YAML files. 
 
 You can find their schema, which describes the expected structure and properties, [here](src/main/resources/schemas).

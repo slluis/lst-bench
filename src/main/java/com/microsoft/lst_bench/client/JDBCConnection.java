@@ -15,12 +15,19 @@
  */
 package com.microsoft.lst_bench.client;
 
+import java.lang.reflect.InvocationTargetException;
+import java.sql.DatabaseMetaData;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.SQLWarning;
 import java.sql.Statement;
+import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Set;
+import java.util.UUID;
 import org.apache.commons.lang3.exception.ExceptionUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -33,11 +40,18 @@ public class JDBCConnection implements Connection {
   private final java.sql.Connection connection;
   private final int maxNumRetries;
   private final boolean showWarnings;
+  private final boolean diagnosticsEnabled = Boolean.getBoolean("lst.jdbc.diagnostics");
+  private final UUID diagnosticId = UUID.randomUUID();
+  private final long openedNanos = System.nanoTime();
+  private String clientConnectionId = "unavailable";
 
   public JDBCConnection(java.sql.Connection connection, int maxNumRetries, boolean showWarnings) {
     this.connection = connection;
     this.maxNumRetries = maxNumRetries;
     this.showWarnings = showWarnings;
+    if (diagnosticsEnabled) {
+      logConnectionDetails();
+    }
   }
 
   @Override
@@ -58,10 +72,28 @@ public class JDBCConnection implements Connection {
     // the 1 default try, thus '<='.
     while (this.maxNumRetries == -1 || errorCount <= this.maxNumRetries) {
       Statement s = null;
+      Exception executionFailure = null;
+      int attempt = errorCount + 1;
       try {
+        trace("createStatement", "enter", attempt);
         s = connection.createStatement();
+        trace("createStatement", "exit", attempt);
+        if (diagnosticsEnabled) {
+          try {
+            LOGGER.info(
+                "JDBC_DIAGNOSTIC diagnosticId={} attempt={} queryTimeoutSeconds={}",
+                diagnosticId,
+                attempt,
+                s.getQueryTimeout());
+          } catch (SQLException e) {
+            LOGGER.warn("Unable to read statement timeout; diagnosticId=" + diagnosticId, e);
+          }
+        }
+        trace("execute", "enter", attempt);
         boolean hasResults = s.execute(sqlText);
+        trace("execute", "exit", attempt);
         if (hasResults) {
+          trace("results", "enter", attempt);
           ResultSet rs = s.getResultSet();
           if (ignoreResults) {
             while (rs.next()) {
@@ -71,27 +103,47 @@ public class JDBCConnection implements Connection {
             queryResult = new QueryResult();
             queryResult.populate(rs);
           }
+          trace("results", "exit", attempt);
         }
         // Log verbosely, if enabled.
         if (this.showWarnings && LOGGER.isWarnEnabled()) {
+          trace("warnings", "enter", attempt);
           LOGGER.warn(
               createWarningString(
                   s,
                   /* prefix= */ errorCount > 0
                       ? ("Retried query, error count: " + errorCount)
                       : ""));
+          trace("warnings", "exit", attempt);
         }
         // Return here if successful.
         return queryResult;
       } catch (Exception e) {
+        executionFailure = e;
         queryResult = null;
+        LOGGER.warn(
+            "Query execution attempt {} failed; diagnosticId={}, clientConnectionId={}",
+            attempt,
+            diagnosticId,
+            clientConnectionId,
+            e);
+        logSqlExceptions(e);
+        String warnings = "";
+        try {
+          trace("errorWarnings", "enter", attempt);
+          warnings = createWarningString(s, /* prefix= */ "");
+          trace("errorWarnings", "exit", attempt);
+        } catch (ClientException warningFailure) {
+          e.addSuppressed(warningFailure);
+          LOGGER.warn("Unable to collect warnings after execution failure.", warningFailure);
+        }
         String lastErrorMsg =
             "Query execution attempt "
                 + (errorCount + 1)
                 + " unsuccessful, will retry "
                 + (this.maxNumRetries - errorCount)
                 + " more times; "
-                + createWarningString(s, /* prefix= */ "")
+                + warnings
                 + "stack trace: "
                 + ExceptionUtils.getStackTrace(e);
 
@@ -99,7 +151,7 @@ public class JDBCConnection implements Connection {
         // debugging.
         if (errorCount == this.maxNumRetries) {
           LOGGER.error(lastErrorMsg);
-          throw new ClientException(lastErrorMsg);
+          throw new ClientException(lastErrorMsg, e);
         } else {
           LOGGER.warn(lastErrorMsg);
         }
@@ -107,16 +159,15 @@ public class JDBCConnection implements Connection {
       } finally {
         if (s != null) {
           try {
+            trace("statement.close", "enter", attempt);
             s.close();
+            trace("statement.close", "exit", attempt);
           } catch (Exception e) {
-            String closingError = "Error when closing statement.";
-            // Only throw error if it has not been thrown in the try block to avoid overwriting the
-            // error.
-            if (errorCount != this.maxNumRetries) {
-              LOGGER.error(closingError);
-              throw new ClientException("Error when closing statement.");
+            if (executionFailure != null) {
+              executionFailure.addSuppressed(e);
+              LOGGER.warn("Error when closing statement after execution failure.", e);
             } else {
-              LOGGER.warn(closingError);
+              throw new ClientException("Error when closing statement.", e);
             }
           }
         }
@@ -129,7 +180,9 @@ public class JDBCConnection implements Connection {
   @Override
   public void close() throws ClientException {
     try {
+      trace("connection.close", "enter", 0);
       connection.close();
+      trace("connection.close", "exit", 0);
     } catch (SQLException e) {
       throw new ClientException(e);
     }
@@ -147,10 +200,73 @@ public class JDBCConnection implements Connection {
           warning = warning.getNextWarning();
         }
       } catch (SQLException e) {
-        throw new ClientException(e.getMessage());
+        throw new ClientException("Error retrieving statement warnings.", e);
       }
     }
 
     return prefix + ";" + String.join("; ", warningList);
+  }
+
+  private void trace(String operation, String boundary, int attempt) {
+    if (diagnosticsEnabled) {
+      LOGGER.info(
+          "JDBC_DIAGNOSTIC utc={} elapsedNanos={} diagnosticId={} clientConnectionId={} pid={} thread={} attempt={} operation={} boundary={}",
+          Instant.now(),
+          System.nanoTime() - openedNanos,
+          diagnosticId,
+          clientConnectionId,
+          ProcessHandle.current().pid(),
+          Thread.currentThread().getName(),
+          attempt,
+          operation,
+          boundary);
+    }
+  }
+
+  private void logConnectionDetails() {
+    // Keep the SQL Server extension optional: other JDBC profiles do not include this driver.
+    try {
+      Object id = connection.getClass().getMethod("getClientConnectionId").invoke(connection);
+      if (id instanceof UUID) {
+        clientConnectionId = id.toString();
+      } else {
+        LOGGER.warn("JDBC connection identity unavailable; diagnosticId={}", diagnosticId);
+      }
+    } catch (NoSuchMethodException e) {
+      LOGGER.info("Driver has no getClientConnectionId method; diagnosticId={}", diagnosticId);
+    } catch (IllegalAccessException | InvocationTargetException e) {
+      LOGGER.warn("Unable to read JDBC connection identity; diagnosticId=" + diagnosticId, e);
+    }
+    trace("connection.open", "observed", 0);
+    try {
+      DatabaseMetaData metadata = connection.getMetaData();
+      LOGGER.info(
+          "JDBC_DIAGNOSTIC diagnosticId={} driver={} driverVersion={} javaVersion={} javaVendor={} networkTimeoutMs={}",
+          diagnosticId,
+          metadata.getDriverName(),
+          metadata.getDriverVersion(),
+          System.getProperty("java.version"),
+          System.getProperty("java.vendor"),
+          connection.getNetworkTimeout());
+    } catch (SQLException e) {
+      LOGGER.warn("Unable to read JDBC diagnostic metadata; diagnosticId=" + diagnosticId, e);
+    }
+  }
+
+  private void logSqlExceptions(Exception failure) {
+    if (failure instanceof SQLException) {
+      Set<SQLException> seen = Collections.newSetFromMap(new IdentityHashMap<>());
+      SQLException sqlFailure = (SQLException) failure;
+      while (sqlFailure != null && seen.add(sqlFailure)) {
+        LOGGER.warn(
+            "JDBC failure diagnosticId={} clientConnectionId={} sqlState={} vendorCode={}",
+            diagnosticId,
+            clientConnectionId,
+            sqlFailure.getSQLState(),
+            sqlFailure.getErrorCode(),
+            sqlFailure);
+        sqlFailure = sqlFailure.getNextException();
+      }
+    }
   }
 }
